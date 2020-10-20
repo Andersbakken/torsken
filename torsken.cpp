@@ -61,24 +61,25 @@ static void (*sRealFree)(void *);
 static void *(*sRealCalloc)(size_t, size_t);
 static void *(*sRealRealloc)(void *, size_t);
 static void *(*sRealReallocarray)(void *, size_t, size_t);
+static bool sEnabled = true;
+static bool sInInit = false;
+static bool sExit = false;
+static char sDumpDir[PATH_MAX];
+static size_t sDumpIndex = 0;
+static pthread_t sThread = 0;
+static const unsigned long long sStarted = mono();
 
 static std::unordered_map<void *, Allocation> &sAllocations()
 {
     static std::unordered_map<void *, Allocation> s;
     return s;
 }
-static bool sEnabled = true;
-static bool sInInit = false;
-static bool sExit = false;
+
 static std::recursive_mutex &sMutex()
 {
     static std::recursive_mutex s;
     return s;
 }
-static char sDumpDir[PATH_MAX];
-static size_t sDumpIndex = 0;
-static std::unique_ptr<std::thread> sThread;
-static const unsigned long long sStarted = mono();
 
 static void dump()
 {
@@ -135,8 +136,7 @@ static void init()
             sExit = true;
         }
         if (sThread) {
-            sThread->join();
-            sThread.reset();
+            pthread_join(sThread, nullptr);
         }
     });
     sInInit = false;
@@ -149,19 +149,20 @@ static void init()
     }
 
     if (const char *interval = getenv("TORSKEN_INTERVAL")) {
-        const int ms = std::max(500, atoi(interval));
-        sThread.reset(new std::thread([ms]() {
+        const uintptr_t ms = std::max(500, atoi(interval));
+        pthread_create(&sThread, nullptr, [](void *arg) -> void * {
+            const useconds_t sleepTime = reinterpret_cast<uintptr_t>(arg) * 1000;
             while (true) {
                 {
                     std::unique_lock<std::recursive_mutex> lock(sMutex());
                     if (sExit)
-                        return;
+                        break;
                     dump();
                 }
-                usleep(ms * 1000);
+                usleep(sleepTime);
             }
-            dump();
-        }));
+            return nullptr;
+        }, reinterpret_cast<void*>(ms));
     }
 
     recursive_mkdir(sDumpDir);
