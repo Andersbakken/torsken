@@ -1,1 +1,12 @@
 /compile_commands.json
+/.gdb_history
+/.ninja_deps
+/.ninja_log
+/CMakeCache.txt
+/CMakeFiles/
+/build.ninja
+/cmake_install.cmake
+/libtorsken.so
+/libtorsken32.so
+/libtorsken64.so
+/rules.ninja
