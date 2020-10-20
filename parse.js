@@ -30,7 +30,7 @@ try {
 }
 
 const lddExec = argv.ldd || "ldd";
-const addr2lineExec = argv.addr2line || "addr2line";
+const addr2lineExec = argv.addr2line || "eu-addr2line";
 
 const resolved = new Map();
 const libs = new Set();
@@ -48,15 +48,23 @@ async function ldd(path)
     }));
 }
 
-async function resolveAddress(address)
+async function resolveAddresses(addresses, index)
 {
-    if (resolved.has(address))
-        return resolved.get(address);
-    const result = await exec(`${addr2lineExec} -e ${argv.exec} ${address}`);
-    const data = result.stdout.trim();
-    console.log("shit", typeof data, data);
-    resolved.set(address, data);
-    return data;
+    const filtered = addresses.filter(addr => !resolved.has(addr));
+    if (filtered.length) {
+        console.log(index, "=>", filtered.length, addresses.length);
+        const result = await exec(`${addr2lineExec} -e ${argv.exec} -a ${filtered.join(" ")}`);
+        const data = result.stdout.trim().split("\n");
+        // console.log("shit", typeof data, data, addresses, filtered);
+        for (let i=0; i<data.length; i += 2) {
+            const addr = filtered[i / 2];
+            resolved.set(addr, data[i + 1]);
+            // console.log("set", addr, data[i + 1]);
+        }
+        // process.exit();
+        // resolved.set(address, data);
+        // return data;
+    }
 }
 
 async function processData(path)
@@ -64,16 +72,19 @@ async function processData(path)
     const nl = nexline({
         input: fs.openSync(path, 'r'), // input can be file, stream, string and buffer
     });
-     // nexline is iterable
+    // nexline is iterable
+    var idx = 0;
     for await (const line of nl) {
-        await Promise.all(line.split(",").map(resolveAddress));
+        // await resolveAddresses(line.split(",").slice(Frames), idx++);
+        // if (++idx % 100 === 0)
+            // console.log(++idx);
     }
 }
 
 async function main()
 {
     await ldd(argv.exec);
-    console.log("got libs", libs);
+    // console.log("got libs", libs);
     await processData(argv.file);
 }
 main();
