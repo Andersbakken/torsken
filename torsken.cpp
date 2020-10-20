@@ -1,5 +1,7 @@
 #include <array>
+#include <circular_buffer.h>
 #include <climits>
+#include <condition_variable>
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <fcntl.h>
@@ -8,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -41,43 +44,6 @@ static inline unsigned long long mono()
     return (static_cast<unsigned long long>(ts.tv_sec) * 1000ull) + (static_cast<unsigned long long>(ts.tv_nsec) / 1000000ull);
 }
 
-struct Allocation {
-    Allocation(Allocation &&) = default;
-    Allocation() = default;
-    Allocation(size_t s) : size(s), time(mono())
-    {
-        ::backtrace(&backtrace[0], BACKTRACE_COUNT);
-    }
-
-    Allocation &operator=(Allocation &&) = default;
-
-    size_t size { 0 };
-    unsigned long long time { 0 };
-    std::array<void *, BACKTRACE_COUNT> backtrace {};
-
-private:
-    Allocation(const Allocation &) = delete;
-    Allocation &operator=(const Allocation &) = delete;
-};
-
-static void *(*sRealMalloc)(size_t);
-static void (*sRealFree)(void *);
-static void *(*sRealCalloc)(size_t, size_t);
-static void *(*sRealRealloc)(void *, size_t);
-static void *(*sRealReallocarray)(void *, size_t, size_t);
-static int (*sRealPosix_memalign)(void **, size_t, size_t);
-static void *(*sRealAligned_alloc)(size_t, size_t);
-static void *(*sRealValloc)(size_t size);
-static void *(*sRealMemalign)(size_t alignment, size_t size);
-static void *(*sRealPvalloc)(size_t size);
-
-static bool sInInit = false;
-static bool sEnabled = true;
-static std::recursive_mutex sMutex;
-static const unsigned long long sStarted = mono();
-static size_t sThreshold = 32;
-static int sFile = -1;
-
 enum Type {
     Malloc = 'm',
     Free = 'f',
@@ -91,26 +57,75 @@ enum Type {
     PValloc = 'P'
 };
 
-inline static void log(Type t, void *ptr, size_t size)
+struct Item
 {
-    if (size < sThreshold)
-        return;
-    std::unique_lock<std::recursive_mutex> lock(sMutex);
-    if (!sEnabled)
-        return;
-    sEnabled = false;
-    const unsigned long long time = mono() - sStarted;
+    Item() = default;
+    Item(Type t, void *p, size_t s, unsigned long long tm)
+        : type(t), ptr(p), size(s), time(tm)
+    {}
+
+    Item &operator=(const Item &) = default;
+
+    Type type;
+    void *ptr;
+    size_t size;
+    unsigned long long time;
     void *backtrace[BACKTRACE_COUNT];
-    const int count = ::backtrace(&backtrace[0], BACKTRACE_COUNT);
-    char buf[16384];
-    int w = snprintf(buf, sizeof(buf), "%c,%zx,%zu,%llu", t, reinterpret_cast<size_t>(ptr), size, time);
-    for (int i=2; i<count; ++i) {
-        w += snprintf(buf + w, sizeof(buf) - w, ",%zx", reinterpret_cast<size_t>(backtrace[i]));
+    int backtraceCount;
+};
+
+static void *(*sRealMalloc)(size_t);
+static void (*sRealFree)(void *);
+static void *(*sRealCalloc)(size_t, size_t);
+static void *(*sRealRealloc)(void *, size_t);
+static void *(*sRealReallocarray)(void *, size_t, size_t);
+static int (*sRealPosix_memalign)(void **, size_t, size_t);
+static void *(*sRealAligned_alloc)(size_t, size_t);
+static void *(*sRealValloc)(size_t size);
+static void *(*sRealMemalign)(size_t alignment, size_t size);
+static void *(*sRealPvalloc)(size_t size);
+
+static pthread_mutex_t sMutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+static pthread_cond_t sCond;
+static pthread_t sThread;
+static bool sStopped = false;
+static bool sInInit = false;
+static bool sEnabled = true;
+static CircularBuffer<1024, Item> sItems;
+static const unsigned long long sStarted = mono();
+static size_t sThreshold = 32;
+static int sFile = -1;
+
+static void *thread(void *)
+{
+    while (true) {
+        Item item;
+        {
+            pthread_mutex_lock(&sMutex);
+            while (sItems.empty() && !sStopped)
+                pthread_cond_wait(&sCond, &sMutex);
+            const bool stopped = sStopped;
+            if (!stopped) {
+                sEnabled = false;
+                item = sItems.pop_front();
+                sEnabled = true;
+            }
+            pthread_mutex_unlock(&sMutex);
+            if (stopped)
+                break;
+        }
+        char buf[512];
+        int w = snprintf(buf, sizeof(buf), "%c,%zx,%zu,%llu,%d\n",
+                         item.type, reinterpret_cast<size_t>(item.ptr), item.size, item.time, item.backtraceCount - 2);
+        // for (int i=2; i<count; ++i) {
+        //     w += snprintf(buf + w, sizeof(buf) - w, ",%zx", reinterpret_cast<size_t>(backtrace[i]));
+        // }
+        // buf[w++] = '\n';
+        ssize_t ret = write(sFile, buf, w);
+        static_cast<void>(ret);
+        backtrace_symbols_fd(item.backtrace + 2, item.backtraceCount - 2, sFile);
     }
-    buf[w++] = '\n';
-    write(sFile, buf, w);
-    // backtrace_symbols_fd(backtrace + 2, count - 2, sFile);
-    sEnabled = true;
+    return nullptr;
 }
 
 static void init()
@@ -127,6 +142,16 @@ static void init()
     sRealMemalign = reinterpret_cast<decltype(sRealMemalign)>(dlsym(RTLD_NEXT, "memalign"));
     sRealPvalloc = reinterpret_cast<decltype(sRealPvalloc)>(dlsym(RTLD_NEXT, "pvalloc"));
 
+    // pthread_cond_init(&sCond, nullptr);
+    // const size_t stackSize = 4096 * 64;
+    // void *stackPointer = mmap(nullptr, stackSize, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+    // pthread_attr_t attr;
+    // pthread_attr_init(&attr);
+    // pthread_attr_setstack(&attr, stackPointer, stackSize);
+    // pthread_create(&sThread, &attr, thread, nullptr);
+    // pthread_attr_destroy(&attr);
+    pthread_create(&sThread, nullptr, thread, nullptr);
+
     atexit([]() {
         if (sFile != STDERR_FILENO) {
             fsync(sFile);
@@ -134,9 +159,9 @@ static void init()
         }
     });
 
-    // get the pthread_conce that happens inside of backtrace(3) to happen first
-    void *backtrace[1];
-    ::backtrace(backtrace, 1);
+    // // get the pthread_once that happens inside of backtrace(3) to happen first
+    // void *backtrace[1];
+    // ::backtrace(backtrace, 1);
 
     if (const char *path = getenv("TORSK_OUTPUT")) {
         sFile = open(path, O_CREAT, 0664);
@@ -157,18 +182,53 @@ static void init()
     sInInit = false;
 }
 
+inline static void log(Type t, void *ptr, size_t size)
+{
+    if (size < sThreshold)
+        return;
+    pthread_mutex_lock(&sMutex);
+    if (sEnabled) {
+        sEnabled = false;
+        const unsigned long long time = mono() - sStarted;
+        sItems.append(Item(t, ptr, size, time));
+        Item &item = sItems.last();
+        item.backtraceCount = ::backtrace(&item.backtrace[0], BACKTRACE_COUNT);
+        pthread_cond_signal(&sCond);
+        // char buf[16384];
+        // int w = snprintf(buf, sizeof(buf), "%c,%zx,%zu,%llu", t, reinterpret_cast<size_t>(ptr), size, time);
+        // for (int i=2; i<count; ++i) {
+        //     w += snprintf(buf + w, sizeof(buf) - w, ",%zx", reinterpret_cast<size_t>(backtrace[i]));
+        // }
+        // buf[w++] = '\n';
+        // write(sFile, buf, w);
+        // backtrace_symbols_fd(backtrace + 2, count - 2, sFile);
+        sEnabled = true;
+    }
+    pthread_mutex_unlock(&sMutex);
+}
+
+
 extern "C" {
 void *malloc(size_t size)
 {
     if (!sRealMalloc)
         init();
     void *const ret = sRealMalloc(size);
-    log(Malloc, ret, size);
+    if (!sInInit)
+        log(Malloc, ret, size);
     return ret;
 }
 
+unsigned char sInitCallocBuffer[1024];
 void free(void *ptr)
 {
+    if (ptr == sInitCallocBuffer)
+        return;
+    // if (sInInit) {
+    //     char buf[1024];
+    //     const int w = snprintf(buf, sizeof(buf), "free %p\n", ptr);
+    //     write(STDOUT_FILENO, buf, w);
+    // }
     sRealFree(ptr);
     log(Free, ptr, 0);
 }
@@ -176,7 +236,16 @@ void free(void *ptr)
 void *calloc(size_t nmemb, size_t size)
 {
     if (sInInit) {
-        return nullptr;
+        if (nmemb == 1 && size == 32) {
+            // this is for dlsym and apparently nullptr is cool
+            return nullptr;
+        }
+        // char buf[1024];
+        // const int w = snprintf(buf, sizeof(buf), "calloc %zu %zu\n", nmemb, size);
+        // write(STDOUT_FILENO, buf, w);
+        // return nullptr;
+        // this is for the thread's stack
+        return sInitCallocBuffer;
     }
 
     if (!sRealCalloc)
