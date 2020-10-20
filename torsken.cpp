@@ -1,14 +1,18 @@
 #include <array>
-#include <thread>
 #include <climits>
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <fcntl.h>
+#include <malloc.h>
 #include <mutex>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/types.h>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 
@@ -61,65 +65,52 @@ static void (*sRealFree)(void *);
 static void *(*sRealCalloc)(size_t, size_t);
 static void *(*sRealRealloc)(void *, size_t);
 static void *(*sRealReallocarray)(void *, size_t, size_t);
-static bool sEnabled = true;
+static int (*sRealPosix_memalign)(void **, size_t, size_t);
+static void *(*sRealAligned_alloc)(size_t, size_t);
+static void *(*sRealValloc)(size_t size);
+static void *(*sRealMemalign)(size_t alignment, size_t size);
+static void *(*sRealPvalloc)(size_t size);
+
 static bool sInInit = false;
-static bool sExit = false;
-static char sDumpDir[PATH_MAX];
-static size_t sDumpIndex = 0;
-static pthread_t sThread = 0;
+static bool sEnabled = true;
+static std::recursive_mutex sMutex;
 static const unsigned long long sStarted = mono();
+static size_t sThreshold = 32;
+static int sFile = -1;
 
-static std::unordered_map<void *, Allocation> &sAllocations()
-{
-    static std::unordered_map<void *, Allocation> s;
-    return s;
-}
+enum Type {
+    Malloc = 'm',
+    Free = 'f',
+    Realloc = 'r',
+    Calloc = 'c',
+    ReallocArray = 'a',
+    PosixMemalign = 'p',
+    AlignedAlloc = 'A',
+    Valloc = 'v',
+    Memalign = 'm',
+    PValloc = 'P'
+};
 
-static std::recursive_mutex &sMutex()
+inline static void log(Type t, void *ptr, size_t size)
 {
-    static std::recursive_mutex s;
-    return s;
-}
-
-static void dump()
-{
-    char buf[PATH_MAX + 16];
-    snprintf(buf, sizeof(buf), "%s/%05zu", sDumpDir, ++sDumpIndex);
-    FILE *f = fopen(buf, "w");
-    if (!f)
+    if (size < sThreshold)
         return;
-
-    for (const auto &ref : sAllocations()) {
-        int w = snprintf(buf, sizeof(buf), "%p,%zu,%llu", ref.first, ref.second.size, ref.second.time - sStarted);
-        fwrite(buf, 1, w, f);
-        for (size_t i = 0; i < BACKTRACE_COUNT && ref.second.backtrace[i]; ++i) {
-            w = snprintf(buf, sizeof(buf), ",%p", ref.second.backtrace[i]);
-            fwrite(buf, 1, w, f);
-        }
-        fwrite("\n", 1, 1, f);
+    std::unique_lock<std::recursive_mutex> lock(sMutex);
+    if (!sEnabled)
+        return;
+    sEnabled = false;
+    const unsigned long long time = mono() - sStarted;
+    void *backtrace[BACKTRACE_COUNT];
+    const int count = ::backtrace(&backtrace[0], BACKTRACE_COUNT);
+    char buf[16384];
+    int w = snprintf(buf, sizeof(buf), "%c,%zx,%zu,%llu", t, reinterpret_cast<size_t>(ptr), size, time);
+    for (int i=2; i<count; ++i) {
+        w += snprintf(buf + w, sizeof(buf) - w, ",%zx", reinterpret_cast<size_t>(backtrace[i]));
     }
-    fclose(f);
-}
-
-static void recursive_mkdir(const char *dir)
-{
-    char tmp[PATH_MAX];
-    char *p = NULL;
-    size_t len;
-
-    snprintf(tmp, sizeof(tmp), "%s", dir);
-    len = strlen(tmp);
-    if (tmp[len - 1] == '/') {
-        tmp[len - 1] = 0;
-    }
-    for (p = tmp + 1; *p; p++) {
-        if (*p == '/') {
-            *p = 0;
-            mkdir(tmp, S_IRWXU);
-            *p = '/';
-        }
-    }
-    mkdir(tmp, S_IRWXU);
+    buf[w++] = '\n';
+    write(sFile, buf, w);
+    // backtrace_symbols_fd(backtrace + 2, count - 2, sFile);
+    sEnabled = true;
 }
 
 static void init()
@@ -130,42 +121,40 @@ static void init()
     sRealCalloc = reinterpret_cast<decltype(sRealCalloc)>(dlsym(RTLD_NEXT, "calloc"));
     sRealRealloc = reinterpret_cast<decltype(sRealRealloc)>(dlsym(RTLD_NEXT, "realloc"));
     sRealReallocarray = reinterpret_cast<decltype(sRealReallocarray)>(dlsym(RTLD_NEXT, "reallocarray"));
+    sRealPosix_memalign = reinterpret_cast<decltype(sRealPosix_memalign)>(dlsym(RTLD_NEXT, "posix_memalign"));
+    sRealAligned_alloc = reinterpret_cast<decltype(sRealAligned_alloc)>(dlsym(RTLD_NEXT, "aligned_alloc"));
+    sRealValloc = reinterpret_cast<decltype(sRealValloc)>(dlsym(RTLD_NEXT, "valloc"));
+    sRealMemalign = reinterpret_cast<decltype(sRealMemalign)>(dlsym(RTLD_NEXT, "memalign"));
+    sRealPvalloc = reinterpret_cast<decltype(sRealPvalloc)>(dlsym(RTLD_NEXT, "pvalloc"));
+
     atexit([]() {
-        {
-            std::unique_lock<std::recursive_mutex> lock(sMutex());
-            sExit = true;
-        }
-        if (sThread) {
-            pthread_join(sThread, nullptr);
+        if (sFile != STDERR_FILENO) {
+            fsync(sFile);
+            ::close(sFile);
         }
     });
-    sInInit = false;
 
-    const char *dir = getenv("TORSKEN_DIR");
-    if (dir) {
-        snprintf(sDumpDir, sizeof(sDumpDir), "%s", dir);
+    // get the pthread_conce that happens inside of backtrace(3) to happen first
+    void *backtrace[1];
+    ::backtrace(backtrace, 1);
+
+    if (const char *path = getenv("TORSK_OUTPUT")) {
+        sFile = open(path, O_CREAT, 0664);
     } else {
-        snprintf(sDumpDir, sizeof(sDumpDir), "/%s/torsken_%d", getenv("PWD"), getpid());
+        // char buf[1024];
+        // snprintf(buf, sizeof(buf), "torsken_%d", getpid());
+        // sFile = open(buf, O_CREAT, 0664);
+        sFile = STDERR_FILENO;
+
+    }
+    if (const char *threshold = getenv("TORSK_THRESHOLD")) {
+        sThreshold = std::max(0, atoi(threshold));
     }
 
-    if (const char *interval = getenv("TORSKEN_INTERVAL")) {
-        const uintptr_t ms = std::max(500, atoi(interval));
-        pthread_create(&sThread, nullptr, [](void *arg) -> void * {
-            const useconds_t sleepTime = reinterpret_cast<uintptr_t>(arg) * 1000;
-            while (true) {
-                {
-                    std::unique_lock<std::recursive_mutex> lock(sMutex());
-                    if (sExit)
-                        break;
-                    dump();
-                }
-                usleep(sleepTime);
-            }
-            return nullptr;
-        }, reinterpret_cast<void*>(ms));
+    if (sFile == -1) {
+        abort();
     }
-
-    recursive_mkdir(sDumpDir);
+    sInInit = false;
 }
 
 extern "C" {
@@ -173,82 +162,77 @@ void *malloc(size_t size)
 {
     if (!sRealMalloc)
         init();
-    std::unique_lock<std::recursive_mutex> lock(sMutex());
-    void *ret = sRealMalloc(size);
-    if (sEnabled) {
-        sEnabled = false;
-        sAllocations()[ret] = Allocation(size);
-        sEnabled = true;
-    }
+    void *const ret = sRealMalloc(size);
+    log(Malloc, ret, size);
     return ret;
 }
-static unsigned char sBuffer[8 * 1024];
+
 void free(void *ptr)
 {
-    if (ptr == sBuffer)
-        return;
-
-    if (!sRealMalloc)
-        init();
-    std::unique_lock<std::recursive_mutex> lock(sMutex());
     sRealFree(ptr);
-    if (sEnabled) {
-        sEnabled = false;
-        sAllocations().erase(ptr);
-        sEnabled = true;
-    }
+    log(Free, ptr, 0);
 }
 
 void *calloc(size_t nmemb, size_t size)
 {
     if (sInInit) {
-        memset(&sBuffer, 0, sizeof(sBuffer));
-        return sBuffer;
+        return nullptr;
     }
 
-    std::unique_lock<std::recursive_mutex> lock(sMutex());
-    if (!sRealMalloc)
+    if (!sRealCalloc)
         init();
-    void *ret = sRealCalloc(nmemb, size);
-    if (sEnabled) {
-        sEnabled = false;
-        sAllocations()[ret] = nmemb * size;
-        sEnabled = true;
-    }
+
+    void *const ret = sRealCalloc(nmemb, size);
+    log(Calloc, ret, nmemb * size);
     return ret;
 }
 
 void *realloc(void *ptr, size_t size)
 {
-    if (!sRealMalloc)
-        init();
-    std::unique_lock<std::recursive_mutex> lock(sMutex());
-    void *ret = sRealRealloc(ptr, size);
-    if (sEnabled) {
-        sEnabled = false;
-        if (ptr != ret) {
-            sAllocations().erase(ptr);
-        }
-        sAllocations()[ret] = size;
-        sEnabled = true;
-    }
+    void *const ret = sRealRealloc(ptr, size);
+    log(Realloc, ret, size);
     return ret;
 }
 
 void *reallocarray(void *ptr, size_t nmemb, size_t size)
 {
-    if (!sRealMalloc)
-        init();
-    std::unique_lock<std::recursive_mutex> lock(sMutex());
-    void *ret = sRealReallocarray(ptr, nmemb, size);
-    if (sEnabled) {
-        sEnabled = false;
-        if (ptr != ret) {
-            sAllocations().erase(ptr);
-        }
-        sAllocations()[ret] = nmemb * size;
-        sEnabled = true;
-    }
+    void *const ret = sRealReallocarray(ptr, nmemb, size);
+    log(ReallocArray, ret, size);
+    return ret;
+}
+
+int posix_memalign(void **memptr, size_t alignment, size_t size)
+{
+    const int ret = sRealPosix_memalign(memptr, alignment, size);
+    log(PosixMemalign, *memptr, size);
+    return ret;
+}
+
+void *aligned_alloc(size_t alignment, size_t size)
+{
+    void *const ret = sRealAligned_alloc(alignment, size);
+    log(AlignedAlloc, ret, size);
+    return ret;
+}
+
+void *valloc(size_t size)
+{
+    void *const ret = sRealValloc(size);
+    log(Valloc, ret, size);
+    return ret;
+}
+
+void *memalign(size_t alignment, size_t size)
+{
+    void *const ret = sRealMemalign(alignment, size);
+    log(Memalign, ret, size);
+    return ret;
+}
+
+void *pvalloc(size_t size)
+{
+    void *const ret = sRealPvalloc(size);
+    log(PValloc, ret, size);
     return ret;
 }
 }
