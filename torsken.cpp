@@ -93,7 +93,7 @@ static void dump()
         int w = snprintf(buf, sizeof(buf), "%p,%zu,%llu", ref.first, ref.second.size, ref.second.time - sStarted);
         fwrite(buf, 1, w, f);
         for (size_t i = 0; i < BACKTRACE_COUNT && ref.second.backtrace[i]; ++i) {
-            w = snprintf(buf, sizeof(buf), " %p", ref.second.backtrace[i]);
+            w = snprintf(buf, sizeof(buf), ",%p", ref.second.backtrace[i]);
             fwrite(buf, 1, w, f);
         }
         fwrite("\n", 1, 1, f);
@@ -103,7 +103,7 @@ static void dump()
 
 static void recursive_mkdir(const char *dir)
 {
-    char tmp[1024];
+    char tmp[PATH_MAX];
     char *p = NULL;
     size_t len;
 
