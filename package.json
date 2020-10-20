@@ -1,0 +1,22 @@
+{
+  "name": "torsken",
+  "version": "1.0.0",
+  "description": "",
+  "main": "parse.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Andersbakken/torsken.git"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Andersbakken/torsken/issues"
+  },
+  "homepage": "https://github.com/Andersbakken/torsken#readme",
+  "dependencies": {
+    "minimist": "^1.2.5"
+  }
+}
