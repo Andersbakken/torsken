@@ -8,12 +8,7 @@ const exec = util.promisify(require('child_process').exec);
 const readFile = util.promisify(fs.readFile);
 const nexline = require("nexline");
 const prettyBytes = require("pretty-bytes");
-
-const Type = 0;
-const Pointer = 1;
-const Size = 2;
-const Time = 3;
-const Frames = 4;
+const demangle = require("demangle");
 
 try {
     if (!fs.lstatSync(argv.file).isFile())
@@ -31,67 +26,32 @@ try {
     process.exit(1);
 }
 
-const lddExec = argv.ldd || "ldd";
 const addr2lineExec = argv.addr2line || "eu-addr2line";
 
-const resolved = new Map();
-const libs = new Set();
-
-async function ldd(path)
-{
-    if (libs.has(path))
-        return;
-    libs.add(path);
-    const data = await exec(`${lddExec} ${argv.exec}`);
-    await Promise.all(data.stdout.split("\n").filter(x => { return x.indexOf(" => /") !== -1; }).map(line => {
-        const p = line.split(" ")[2];
-        // console.log("balls", p);
-        return ldd(p);
-    }));
-}
-
-async function resolveAddresses(addresses, index)
-{
-    const filtered = addresses.filter(addr => !resolved.has(addr));
-    if (filtered.length) {
-        console.log(index, "=>", filtered.length, addresses.length);
-        const result = await exec(`${addr2lineExec} -e ${argv.exec} -a ${filtered.join(" ")}`);
-        const data = result.stdout.trim().split("\n");
-        // console.log("shit", typeof data, data, addresses, filtered);
-        for (let i=0; i<data.length; i += 2) {
-            const addr = filtered[i / 2];
-            resolved.set(addr, data[i + 1]);
-            // console.log("set", addr, data[i + 1]);
-        }
-        // process.exit();
-        // resolved.set(address, data);
-        // return data;
-    }
-}
+const libs = [];
 
 class Allocation
 {
-    constructor(type, size, offset)
+    constructor(size, libId, offset)
     {
-        this.type = type;
         this.size = size;
+        this.libId = libId;
         this.offset = offset;
-        // console.log("got newed", arguments);
     }
 };
 
 class Snapshot
 {
-    constructor(time, bytes, allocationCount)
+    constructor(allocationIndex, bytes, allocationCount)
     {
-        this.time = time;
+        this.allocationIndex = allocationIndex;
         this.bytes = bytes;
         this.allocationCount = allocationCount;
     }
 
     toString()
     {
-        return `${new Date(this.time).toISOString().substr(11, 8)} - ${prettyBytes(this.bytes)} - ${this.allocationCount} allocs`;
+        return `index: ${this.allocationIndex} - ${prettyBytes(this.bytes)} - ${this.allocationCount} allocs`;
     }
 }
 
@@ -103,76 +63,83 @@ async function processData(path)
     let count = 0;
     const current = new Map();
     const snapshots = [];
-    let lastSnapshot = undefined;
     let bytesAllocated = 0;
+    if (data.lastIndexOf("= Start\n", 0) === 0) {
+        last = 8;
+    }
     while (true) {
         const idx = data.indexOf("\n", last);
         if (idx === -1)
             break;
-        // let addrsStart = data.indexOf(",", data.indexOf(",", last + 11) + 1);
-        // console.log("got addrsStart", last, idx, addrsStart, data.indexOf(",", last + 11));
-        const split = data.substring(last + 2, idx).split(",");
-        // const line = data.substring(last, idx);
-        const old = last;
+        if (++count % 1000 === 0) {
+            snapshots.push(new Snapshot(count, bytesAllocated, current.size));
+        }
+
+        const line = data.substring(last + 2, idx);
+        const oldLast = last;
         last = idx + 1;
-        if (split.length < 3) {
-            // console.log("bad line", data.substring(old, idx));
-            // process.exit(0);
-            continue;
-        }
-        const time = parseInt(split[2]);
 
-        if (lastSnapshot === undefined) {
-            if (time >= 1000) {
-                // discard allocations that happened before sStarted was set
-                continue;
+        let lib;
+        let addr;
+        let size; // undefined means free
+        let ptr;
+        let func;
+
+        const parenEnd = line.indexOf(")[");
+        let bracketStart;
+        let bracketEnd;
+        if (parenEnd !== -1) {
+            const parenStart = line.lastIndexOf(":(", parenEnd);
+            if (parenStart === -1) {
+                throw new Error("Bad line " + line);
             }
-            lastSnapshot = time;
-        } else if (time - lastSnapshot >= 500) {
-            snapshots.push(new Snapshot(lastSnapshot, bytesAllocated, current.size));
-            // console.log("bytesAllocated", bytesAllocated);
-            lastSnapshot = time;
+            func = line.substring(parenStart + 2, parenEnd);
+            lib = line.substring(0, parenStart);
+            bracketStart = parenEnd + 1;
+        } else {
+            bracketStart = line.indexOf(":[") + 1;
+            lib = line.substring(0, bracketStart - 1);
         }
 
-        // console.log(split, count);
-        const ptr = split[0];
-        if (data[last] === 'f') {
-            // console.log("got free", data[last]);
+        bracketEnd = line.indexOf("]", bracketStart);
+        if (bracketEnd === -1) {
+            throw new Error("Bad line 2 " + line);
+        }
+
+        addr = line.substring(bracketStart + 1, bracketEnd);
+
+        const type = line[bracketEnd + 2];
+        if (type === "+" || type === ">") {
+            const lastSpace = line.lastIndexOf(" ");
+            size = parseInt(line.substr(lastSpace + 1), 16);
+            ptr = line.substring(bracketEnd + 4, lastSpace);
+            let libId = libs.indexOf(lib);
+            if (libId === -1) {
+                libId = libs.size;
+                libs.push(lib);
+            }
+            const alloc = new Allocation(size, libId, last);
+            current.set(ptr, alloc);
+            bytesAllocated += alloc.size;
+        } else {
+            ptr = line.substring(bracketEnd + 4);
             let c = current.get(ptr);
             if (c) {
                 bytesAllocated -= c.size;
                 // console.log("fuck3", bytesAllocated);
                 current.delete(ptr);
             } else {
-                // console.log("Can't find free", split);
+                // console.log("Can't find free", ptr, current.keys());
             }
-        } else {
-            const alloc = new Allocation(data[last], parseInt(split[1]), parseInt(split[2]));
-            // console.log("fuck", bytesAllocated);
-            bytesAllocated += alloc.size;
-            // if (isNaN(bytesAllocated)) {
-            //     console.log("shit", bytesAllocated, alloc.size, line);
-            //     process.exit();
-            // }
-            // console.log("bytesAllocated", data[last], bytesAllocated, alloc.size,
-            //             line);
-            // console.log("fuck2", bytesAllocated);
-            // console.log(typeof alloc.size, alloc, split[1], split);
-            current.set(ptr, alloc);
         }
-
-        // if (++count > 100)
-        //     break;
     }
 
-    console.log("snapshots", snapshots.map(x => x.toString()));
-
-    // console.log("got data", data.length, count);
+    console.log("libs", libs);
+    console.log("snapshots", JSON.stringify(snapshots.map(x => x.toString()), undefined, 4));
 }
 
 async function main()
 {
-    await ldd(argv.exec);
     // console.log("got libs", libs);
     await processData(argv.file);
 }

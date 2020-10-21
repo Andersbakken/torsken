@@ -17,6 +17,7 @@
   },
   "homepage": "https://github.com/Andersbakken/torsken#readme",
   "dependencies": {
+    "demangle": "^1.0.1",
     "minimist": "^1.2.5",
     "nexline": "^1.2.1",
     "pretty-bytes": "^5.4.1"
