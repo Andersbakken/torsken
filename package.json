@@ -18,6 +18,7 @@
   "homepage": "https://github.com/Andersbakken/torsken#readme",
   "dependencies": {
     "minimist": "^1.2.5",
-    "nexline": "^1.2.1"
+    "nexline": "^1.2.1",
+    "pretty-bytes": "^5.4.1"
   }
 }

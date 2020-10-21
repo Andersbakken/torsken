@@ -16,10 +16,6 @@
 #include <unistd.h>
 #include <unordered_map>
 
-#ifndef BACKTRACE_COUNT
-#define BACKTRACE_COUNT 32
-#endif
-
 static inline unsigned long long mono()
 {
     timespec ts;
@@ -41,25 +37,6 @@ static inline unsigned long long mono()
     return (static_cast<unsigned long long>(ts.tv_sec) * 1000ull) + (static_cast<unsigned long long>(ts.tv_nsec) / 1000000ull);
 }
 
-struct Allocation {
-    Allocation(Allocation &&) = default;
-    Allocation() = default;
-    Allocation(size_t s) : size(s), time(mono())
-    {
-        ::backtrace(&backtrace[0], BACKTRACE_COUNT);
-    }
-
-    Allocation &operator=(Allocation &&) = default;
-
-    size_t size { 0 };
-    unsigned long long time { 0 };
-    std::array<void *, BACKTRACE_COUNT> backtrace {};
-
-private:
-    Allocation(const Allocation &) = delete;
-    Allocation &operator=(const Allocation &) = delete;
-};
-
 static void *(*sRealMalloc)(size_t);
 static void (*sRealFree)(void *);
 static void *(*sRealCalloc)(size_t, size_t);
@@ -70,6 +47,9 @@ static void *(*sRealAligned_alloc)(size_t, size_t);
 static void *(*sRealValloc)(size_t size);
 static void *(*sRealMemalign)(size_t alignment, size_t size);
 static void *(*sRealPvalloc)(size_t size);
+// static int (*sRealBacktrace)(void **, int);
+// static char **(*sRealBacktrace_symbols)(void *const *, int);
+// static void (*sRealBacktrace_symbols_fd)(void *const *, int, int);
 
 static bool sInInit = false;
 static bool sEnabled = true;
@@ -77,6 +57,7 @@ static std::recursive_mutex sMutex;
 static const unsigned long long sStarted = mono();
 static size_t sThreshold = 32;
 static int sFile = -1;
+// static size_t sBacktraceCount = 32;
 
 enum Type {
     Malloc = 'm',
@@ -95,26 +76,28 @@ inline static void log(Type t, void *ptr, size_t size)
 {
     if (size < sThreshold)
         return;
+    void *backtrace[128];
+    const int count = ::backtrace(&backtrace[0], 32);
     std::unique_lock<std::recursive_mutex> lock(sMutex);
     if (!sEnabled)
         return;
     sEnabled = false;
     const unsigned long long time = mono() - sStarted;
-    void *backtrace[BACKTRACE_COUNT];
-    const int count = ::backtrace(&backtrace[0], BACKTRACE_COUNT);
     char buf[16384];
     int w = snprintf(buf, sizeof(buf), "%c,%zx,%zu,%llu", t, reinterpret_cast<size_t>(ptr), size, time);
     for (int i=2; i<count; ++i) {
         w += snprintf(buf + w, sizeof(buf) - w, ",%zx", reinterpret_cast<size_t>(backtrace[i]));
     }
     buf[w++] = '\n';
-    write(sFile, buf, w);
+    ssize_t ret = write(sFile, buf, w);
+    static_cast<void>(ret);
     // backtrace_symbols_fd(backtrace + 2, count - 2, sFile);
     sEnabled = true;
 }
 
 static void init()
 {
+    // sleep(5);
     sInInit = true;
     sRealMalloc = reinterpret_cast<decltype(sRealMalloc)>(dlsym(RTLD_NEXT, "malloc"));
     sRealFree = reinterpret_cast<decltype(sRealFree)>(dlsym(RTLD_NEXT, "free"));
@@ -126,6 +109,9 @@ static void init()
     sRealValloc = reinterpret_cast<decltype(sRealValloc)>(dlsym(RTLD_NEXT, "valloc"));
     sRealMemalign = reinterpret_cast<decltype(sRealMemalign)>(dlsym(RTLD_NEXT, "memalign"));
     sRealPvalloc = reinterpret_cast<decltype(sRealPvalloc)>(dlsym(RTLD_NEXT, "pvalloc"));
+    // sRealBacktrace = reinterpret_cast<decltype(sRealBacktrace)>(dlsym(RTLD_NEXT, "backtrace"));
+    // sRealBacktrace_symbols = reinterpret_cast<decltype(sRealBacktrace_symbols)>(dlsym(RTLD_NEXT, "backtrace_symbols"));
+    // sRealBacktrace_symbols_fd = reinterpret_cast<decltype(sRealBacktrace_symbols_fd)>(dlsym(RTLD_NEXT, "backtrace_symbols_fd"));
 
     atexit([]() {
         if (sFile != STDERR_FILENO) {
@@ -235,4 +221,33 @@ void *pvalloc(size_t size)
     log(PValloc, ret, size);
     return ret;
 }
+
+// int backtrace(void **buffer, int size)
+// {
+//     // std::unique_lock<std::recursive_mutex> lock(sMutex);
+//     // if (size != sBacktraceCount || true) {
+//     //     write(STDERR_FILENO, "BALLS1\n", 7);
+//     //     char buf[1024];
+//     //     int w = snprintf(buf, sizeof(buf), "%d\n", size);
+//     //     write(STDERR_FILENO, buf, w);
+//     //     _exit(1);
+//     // }
+//     return sRealBacktrace(buffer, size);
+// }
+
+// char **backtrace_symbols(void *const *buffer, int size)
+// {
+//     // write(STDERR_FILENO, "BALLS2\n", 7);
+//     // _exit(1);
+//     // std::unique_lock<std::recursive_mutex> lock(sMutex);
+//     return sRealBacktrace_symbols(buffer, size);
+// }
+
+// void backtrace_symbols_fd(void *const *buffer, int size, int fd)
+// {
+//     // write(STDERR_FILENO, "BALLS3\n", 7);
+//     // _exit(1);
+//     // std::unique_lock<std::recursive_mutex> lock(sMutex);
+//     return sRealBacktrace_symbols_fd(buffer, size, fd);
+// }
 }
