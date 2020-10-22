@@ -89,6 +89,12 @@ async function processData(options)
     if (options.snapshotEvery) {
         snapshots = [];
     }
+    let nextIndex;
+    const indexByteInterval = data.length / 20;
+    if (options.createIndex) {
+        index = [];
+        nextIndex = indexByteInterval;
+    }
     const printEvery = options.max ? Math.max(1, Math.floor(options.max / 10)) : 10000;
     while (true) {
         const idx = data.indexOf("\n", last);
@@ -138,7 +144,7 @@ async function processData(options)
                 libs.push(lib);
             }
             if (func && options.demangle) {
-                func = demangle(func);
+                func = demangle(func) || func;
             }
             const alloc = new Allocation(size, func, libId, last);
             current[ptr] = alloc;
@@ -162,6 +168,11 @@ async function processData(options)
             snapshots.push(new Snapshot(count, bytesAllocated, currentSize));
         }
 
+        if (options.createIndex && idx >= nextIndex) {
+            index.push({ offset: idx, data: Object.assign({}, current) });
+            nextIndex = idx + indexByteInterval;
+        }
+
         if (!options.silent && count % printEvery === 0) {
             if (options.max) {
                 console.log(`Processed ${count}/${options.max} lines, ${((count / options.max) * 100.0).toFixed(1)}%`);
@@ -182,7 +193,6 @@ async function processData(options)
         // console.log("libs", libs);
         // console.log("snapshots", JSON.stringify(snapshots.map(x => x.toString()), undefined, 4));
     // }
-    console.log("shit");
     return current;
 }
 
@@ -242,8 +252,9 @@ async function main()
 {
     // console.log("got libs", libs);
     const options = new Options;
-    options.max = 1000000;
+    // options.max = 1000000;
     options.createLibs = true;
+    options.createIndex = true;
     await processData(options);
     await createServer(argv.port || 8888);
     console.log("listening on", argv.port || 8888);
